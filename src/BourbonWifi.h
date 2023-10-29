@@ -3,22 +3,37 @@
 
 #include <Arduino.h>
 #include "SPIFFS.h"
-
-// #define MSGPACK_DEBUGLOG_ENABLE
-// #include <MsgPack.h>
+#include <DNSServer.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
 
 struct WifiConfig{
   String wsid;
   String pass;
-  // MSGPACK_DEFINE(wsid, pass);
 };
+
+const char indexHtml[] PROGMEM = R"HTML(
+      <!DOCTYPE HTML>
+      <html>
+        <head>
+        <title>Config</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+        </head>
+        <body>
+          <h1>Configuration</h1>
+        </body>
+      </html>)HTML";
 
 
 class BourbonWifi{
   private:
     static constexpr const char* CONFIG_FILE_NAME = "/.wificonfig";
+        
     static BourbonWifi* instance;
     WifiConfig config;
+    DNSServer *dnsServer;
+    AsyncWebServer *server;
+
     BourbonWifi() {};
 
   public:
@@ -29,6 +44,54 @@ class BourbonWifi{
       return instance;
     }
 
+    void setupWebServer(){
+      class CaptiveRequestHandler : public AsyncWebHandler {
+        public:
+          CaptiveRequestHandler() {}
+          virtual ~CaptiveRequestHandler() {}
+
+          bool canHandle(AsyncWebServerRequest *request){
+            return true;
+          }
+
+          void handleRequest(AsyncWebServerRequest *request) {
+            request->send_P(200, "text/html", indexHtml); 
+          }
+      };
+      this->server = new AsyncWebServer(80);
+      server->on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", indexHtml); 
+        Serial.println("Client Connected");
+      });
+      server->addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);
+      server->begin();
+    }
+
+    static void processDNS(void *params){
+      BourbonWifi *self = (BourbonWifi *) params;
+      for(;;){
+        self->dnsServer->processNextRequest();
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+      }
+    }
+
+    void initConfigAccessPoint(){
+      WiFi.mode(WIFI_AP); 
+      WiFi.softAP("ESP-WifiConfig");
+      dnsServer = new DNSServer();
+      dnsServer->start(53, "*", WiFi.softAPIP());
+      xTaskCreate(BourbonWifi::processDNS,
+        "Process DNS",
+        (10 * 1024),
+        (void *) this,
+        1,
+        NULL);
+      this->setupWebServer();
+      Serial.println("Webserver running!");
+      Serial.print("AP IP address: ");
+      Serial.println(WiFi.softAPIP());
+    }
+
     void readConfig(){
       if (!SPIFFS.begin(true)) {
         Serial.println("Can't read WiFi configuration.");
@@ -36,6 +99,7 @@ class BourbonWifi{
       }
       if (!SPIFFS.exists(BourbonWifi::CONFIG_FILE_NAME)){
         Serial.println("Config does not exist");
+        this->initConfigAccessPoint();
         return;
       }
       File configFile = SPIFFS.open(BourbonWifi::CONFIG_FILE_NAME, FILE_READ);
